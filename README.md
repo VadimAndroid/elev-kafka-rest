@@ -1,282 +1,209 @@
-# Elev-system: elev-api og elev-service
+# elev-kafka-rest
 
 [![CI](https://github.com/VadimAndroid/elev-kafka-rest/actions/workflows/ci.yml/badge.svg?branch=portfolio)](https://github.com/VadimAndroid/elev-kafka-rest/actions/workflows/ci.yml)
 
-To Spring Boot-tjenester skrevet i Kotlin som samarbeider via **Kafka** og **HTTP**.
-`elev-service` lagrer elevene i **PostgreSQL**, slik at de finnes også etter omstart.
-`elev-api` har ingen database.
+Two Spring Boot services in Kotlin that manage students (*elever*). They talk to each other
+**asynchronously over Kafka** (create) and **synchronously over HTTP** (read).
+Students are stored in **PostgreSQL**.
 
-> Dette er grenen **`portfolio`**. Skoleversjonen med H2-database ligger i grenen `main`.
+> This is the **`portfolio`** branch. The original school assignment (H2 database, Norwegian README) is on `main`.
 
-## Arkitektur
+## Tech stack
 
+Kotlin 2.3 · Java 25 · Spring Boot 4.1 · Spring Kafka · Spring Data JPA / Hibernate · PostgreSQL 17 · Flyway ·
+Apache Kafka 4.3 (KRaft) · Spring Boot Actuator · JUnit 5 · MockMvc · Mockito · Testcontainers · Awaitility ·
+Docker / Docker Compose · GitHub Actions
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Client])
+
+    subgraph api [elev-api :8080]
+        ctrl[ElevController<br/>validation, id generation]
+    end
+
+    subgraph kafka [Kafka]
+        topic[(topic: elever)]
+        dlt[(topic: elever.DLT)]
+    end
+
+    subgraph svc [elev-service :8081]
+        consumer[ElevConsumer]
+        rest[ElevController]
+    end
+
+    db[(PostgreSQL<br/>table elev)]
+
+    client -- "POST /elever" --> ctrl
+    ctrl -- "publish JSON<br/>key = student id" --> topic
+    topic --> consumer
+    consumer -- "save (upsert by id)" --> db
+    consumer -. "broken message" .-> dlt
+
+    client -- "GET /elever" --> ctrl
+    ctrl -- "HTTP GET" --> rest
+    rest -- "SELECT" --> db
 ```
-Opprette elev (asynkront):
-Klient ──HTTP POST──▶ elev-api ──Kafka (topic "elever")──▶ elev-service ──▶ PostgreSQL
 
-Hente elever (synkront):
-Klient ──HTTP GET───▶ elev-api ──HTTP GET──▶ elev-service ──▶ leser fra PostgreSQL
-```
+| Service | Port | Responsibility |
+|---------|------|----------------|
+| `elev-api` | 8080 | The only entry point for clients. Validates input, generates the id, publishes to Kafka, reads from `elev-service`. Has no database. |
+| `elev-service` | 8081 | Consumes students from Kafka and stores them in PostgreSQL. Exposes read endpoints. |
+| Kafka | 9092 | Message broker (KRaft mode, no ZooKeeper). |
+| PostgreSQL | 5432 | Database for `elev-service`, data in the Docker volume `elev-pgdata`. |
 
-| Tjeneste       | Port | Ansvar                                                                 |
-|----------------|------|------------------------------------------------------------------------|
-| `elev-api`     | 8080 | Eneste inngang for klienten. Validerer, genererer ID, sender til Kafka, henter fra `elev-service`. Lagrer ingenting selv. |
-| `elev-service` | 8081 | Leser elever fra Kafka og lagrer dem i databasen. Tilbyr GET-endepunkter som leser fra databasen. |
-| Kafka          | 9092 | Meldingskø mellom tjenestene (kjører i Docker).                        |
-| PostgreSQL     | 5432 | Databasen til `elev-service` (kjører i Docker, data i volumet `elev-pgdata`). |
+### Why Kafka for create and HTTP for read?
 
-## Forutsetninger
+- **Create is asynchronous.** `elev-api` does not depend on `elev-service` being up. The message waits in Kafka
+  until it is consumed, so no student is lost. That is why `POST` returns **202 Accepted**, not 201 Created:
+  the student is accepted, but maybe not stored yet.
+- **Read is synchronous.** The client needs the answer now. If `elev-service` is down, `elev-api` returns
+  **503 Service Unavailable**, not an empty list, because an empty list would be wrong information.
 
-- Java 25 (JDK)
-- Docker Desktop
+## Running
 
-## Slik starter du
+Requirements: **Docker Desktop**, and **Java 25** to run outside Docker.
 
-Start i denne rekkefølgen, fra mappen `elev-kafka-rest`:
-
-**1. Start Kafka og PostgreSQL**
+### Everything in Docker
 
 ```bash
-docker compose up -d
-docker ps          # kafka skal ha status "Up", elev-postgres "Up (healthy)"
+docker compose --profile app up -d --build
+docker compose ps                      # all four containers should be "healthy"
 ```
 
-Topicen `elever` opprettes automatisk ved første melding. Den kan også opprettes manuelt:
+Stop with `docker compose --profile app down`. Add `-v` to also delete the database volume.
+
+### Services from IntelliJ / Gradle (development)
 
 ```bash
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --create --topic elever
+docker compose up -d                   # only Kafka and PostgreSQL
+cd elev-service && ./gradlew bootRun   # terminal 1
+cd elev-api && ./gradlew bootRun       # terminal 2
 ```
 
-**2. Start elev-service** (port 8081)
+The app services are in the compose profile `app`, so plain `docker compose up -d` starts only the infrastructure.
+
+### Try it
 
 ```bash
-cd elev-service
-./gradlew bootRun
+curl -i -X POST localhost:8080/elever -H 'Content-Type: application/json' \
+  -d '{"navn":"Ola Nordmann","klasse":"10A"}'
+curl localhost:8080/elever
+curl localhost:8080/elever/<id>
+curl localhost:8080/actuator/health
 ```
 
-**3. Start elev-api** (port 8080) – i en ny terminal
+## API
+
+### elev-api (port 8080)
+
+| Method | Path | Response |
+|--------|------|----------|
+| POST | `/elever` | `202` with the student (incl. id) · `400` if `navn`/`klasse` is blank · `503` if Kafka fails |
+| GET | `/elever` | `200` with a list (possibly `[]`) · `503` if `elev-service` is down |
+| GET | `/elever/{id}` | `200` · `404` if not found · `503` if `elev-service` is down |
+| GET | `/actuator/health` | `200` `{"status":"UP"}` |
+
+Request body: `{ "navn": "Ola Nordmann", "klasse": "10A" }`
+
+### elev-service (port 8081)
+
+| Method | Path | Response |
+|--------|------|----------|
+| GET | `/elever` | `200` with all students from the database |
+| GET | `/elever/{id}` | `200` · `404` if not in the database |
+| GET | `/actuator/health` | `200` when the app and the database are up |
+
+## Design decisions
+
+### Database and migrations
+
+- The schema is created by **Flyway** (`elev-service/src/main/resources/db/migration/V1__opprett_elev_tabell.sql`),
+  not by Hibernate. Hibernate runs with `ddl-auto=validate` and only checks that `ElevEntity` matches the table.
+- An applied migration is never edited (Flyway detects it by checksum). Schema changes go in a new `V2__...sql`.
+- `ElevEntity` (JPA, mutable) is kept separate from `Elev` (immutable data class used in JSON).
+
+### No duplicates (idempotent consumer)
+
+Kafka delivers **at least once**, so the same message can be read twice.
+The student id is generated by `elev-api`, sent in the message and used as the **primary key**.
+`save()` therefore does `SELECT` → `INSERT` if new, `UPDATE` if it exists. There can only be one row per id.
+
+The id is also the Kafka message key, so all messages for one student go to the same partition, in order.
+
+### Error handling: Dead Letter Topic
+
+A message that can never be processed (a *poison pill*, e.g. broken JSON) must not block the partition.
+`KafkaConfig` sets up a `DefaultErrorHandler`:
+
+- temporary errors (e.g. the database is down for a moment) are retried **3 times, 1 second apart**
+- JSON errors are **not retried**, because they will never succeed
+- after that, the message is published unchanged to **`elever.DLT`**, and the consumer continues with the next message
+
+Inspect the DLT:
 
 ```bash
-cd elev-api
-./gradlew bootRun
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic elever.DLT --from-beginning
 ```
 
-Tjenestene kan også startes fra IntelliJ med ▶ ved `fun main` i `ElevServiceApplication.kt` og `ElevApiApplication.kt`.
-**Stoppe:** `Ctrl + C` i hver terminal, og `docker compose down` for Kafka og PostgreSQL.
-Dataene i PostgreSQL ligger i Docker-volumet `elev-pgdata` og blir **ikke** slettet av `docker compose down`.
-`docker compose down -v` sletter også volumet, altså alle elevene.
+### Kafka listeners
 
-### Alt i Docker med én kommando
+Containers reach Kafka at `kafka:29092`, while programs on the host reach it at `localhost:9092`.
+Kafka tells clients which address to use (*advertised listeners*), so it has two listeners: `INTERNAL` and `EXTERNAL`.
 
-Begge tjenestene har en `Dockerfile`. De ligger i compose-profilen `app`, så de starter bare når profilen er med:
+### Configuration
+
+All addresses come from environment variables with local defaults, for example
+`${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}`. The code is the same everywhere. Only the environment changes.
+
+| Variable | Service | Local default | In Docker |
+|----------|---------|---------------|-----------|
+| `KAFKA_BOOTSTRAP_SERVERS` | both | `localhost:9092` | `kafka:29092` |
+| `ELEV_SERVICE_URL` | elev-api | `http://localhost:8081` | `http://elev-service:8081` |
+| `DB_URL` | elev-service | `jdbc:postgresql://localhost:5432/elevdb` | `jdbc:postgresql://postgres:5432/elevdb` |
+| `DB_USER` / `DB_PASSWORD` | elev-service | `elev` / `elev` | `elev` / `elev` |
+
+### Docker images
+
+Multi-stage `Dockerfile`: the jar is built with Gradle in `eclipse-temurin:25-jdk`, and runs in the smaller
+`eclipse-temurin:25-jre` as a non-root user. Compose healthchecks use `/actuator/health`, and `elev-api`
+starts only when `elev-service` is healthy.
+
+## Tests
 
 ```bash
-docker compose --profile app up -d --build   # Kafka, PostgreSQL, elev-service og elev-api
-docker compose --profile app down            # stopper alt
+cd elev-service && ./gradlew test   # needs Docker (Testcontainers)
+cd elev-api && ./gradlew test
 ```
 
-Porter 8080 og 8081 må være ledige, så stopp tjenestene i IntelliJ først.
+| Service | Type | What is tested |
+|---------|------|----------------|
+| `elev-service` | Integration, **Testcontainers** (real PostgreSQL + Kafka) | Kafka message → database → GET · the same message twice gives one row · a broken message goes to the DLT and does not block the next one · empty list · 404 |
+| `elev-api` | Web layer, `@WebMvcTest` + Mockito mocks | `202` (and input is trimmed) · `400` and nothing sent to Kafka · `503` when Kafka fails · `200` · `404` · `503` when `elev-service` is down |
 
-| Fil | Hva den gjør |
-|-----|--------------|
-| `Dockerfile` | To steg: bygger jar-filen med Gradle i `eclipse-temurin:25-jdk`, og kjører den i det mindre `eclipse-temurin:25-jre`. Appen kjører som egen bruker, ikke root. |
-| `.dockerignore` | Holder `build`, `.gradle` og lignende utenfor bildet. |
+The Testcontainers tests start their own containers and never touch the compose database.
 
-**To lyttere i Kafka.** En container når Kafka på `kafka:29092`, mens IntelliJ på maskinen din når den på `localhost:9092`. Derfor har Kafka to lyttere (`INTERNAL` og `EXTERNAL`). Adressene settes med miljøvariabler i `docker-compose.yaml`:
+### CI
 
-| Variabel | Lokalt (standard) | I Docker |
-|----------|-------------------|----------|
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | `kafka:29092` |
-| `DB_URL` | `jdbc:postgresql://localhost:5432/elevdb` | `jdbc:postgresql://postgres:5432/elevdb` |
-| `ELEV_SERVICE_URL` | `http://localhost:8081` | `http://elev-service:8081` |
+`.github/workflows/ci.yml` runs on every push and pull request:
 
-## Database
+1. **Test**: `./gradlew test` for both services in parallel (Testcontainers uses Docker on the runner).
+2. **Docker image**: builds both Dockerfiles, only if the tests pass. Images are not published.
 
-### Oppsett
+The test report is uploaded as an artifact when a test fails.
 
-`elev-service` bruker **PostgreSQL 17** og **Spring Data JPA** (med Hibernate).
-
-| Del | Fil | Hva den gjør |
-|-----|-----|--------------|
-| Database | `docker-compose.yaml` | PostgreSQL-container `elev-postgres`, database `elevdb`, data i volumet `elev-pgdata` |
-| Tilkobling | `application.properties` | `jdbc:postgresql://localhost:5432/elevdb`, kan overstyres med miljøvariabler |
-| Tabell | `src/main/resources/db/migration/V1__opprett_elev_tabell.sql` | Flyway-migrering som lager tabellen `elev` |
-| Entity | `model/ElevEntity.kt` | JPA-klassen som tilsvarer én rad i `elev` |
-| Repository | `repository/ElevRepository.kt` | `JpaRepository<ElevEntity, UUID>` – gir `save`, `findById`, `findAll` |
-
-```properties
-spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/elevdb}
-spring.datasource.username=${DB_USER:elev}
-spring.datasource.password=${DB_PASSWORD:elev}
-spring.jpa.hibernate.ddl-auto=validate
-spring.jpa.show-sql=true
-```
-
-`${DB_PASSWORD:elev}` betyr: bruk miljøvariabelen `DB_PASSWORD` hvis den finnes, ellers `elev`.
-Lokalt fungerer standardverdiene direkte. I et ekte miljø settes passordet som miljøvariabel og ligger ikke i git.
-
-Avhengigheter i `elev-service/build.gradle.kts`:
-
-```kotlin
-implementation("org.springframework.boot:spring-boot-starter-data-jpa")
-implementation("org.springframework.boot:spring-boot-starter-flyway")
-implementation("org.flywaydb:flyway-database-postgresql")  // Flyway trenger egen modul per database
-runtimeOnly("org.postgresql:postgresql")                    // JDBC-driver
-```
-
-Tabellen `elev`:
-
-| Kolonne  | Type           | Merknad |
-|----------|----------------|---------|
-| `id`     | `UUID`         | Primærnøkkel. Kommer fra Kafka-meldingen – databasen lager ikke en ny ID. |
-| `navn`   | `VARCHAR(255)` | `NOT NULL` |
-| `klasse` | `VARCHAR(255)` | `NOT NULL` |
-
-### Migreringer med Flyway
-
-Tabellene lages av **Flyway**, ikke av Hibernate. Ved oppstart sjekker Flyway tabellen `flyway_schema_history` og kjører bare migreringer som ikke er kjørt før.
-Hibernate står på `ddl-auto=validate`, så det kun *sjekker* at `ElevEntity` stemmer med tabellen og stopper oppstarten hvis ikke.
-
-- En migrering som allerede er kjørt, skal **ikke** endres (Flyway oppdager det via checksum).
-- Endringer i skjemaet gjøres med en ny fil, for eksempel `V2__legg_til_epost.sql`.
-
-### Kontrollere innholdet i databasen
-
-**Med `psql` i containeren:**
+## Inspecting the database
 
 ```bash
 docker exec -it elev-postgres psql -U elev -d elevdb
 ```
 
-**Med IntelliJ:** Database-vinduet → `+` → Data Source → PostgreSQL →
-host `localhost`, port `5432`, database `elevdb`, bruker `elev`, passord `elev`.
-
-Nyttige spørringer:
-
 ```sql
-SELECT * FROM elev;                                -- alle elever
-SELECT COUNT(*) FROM elev;                         -- antall rader
-SELECT id, COUNT(*) FROM elev GROUP BY id
-  HAVING COUNT(*) > 1;                             -- duplikater (skal gi 0 rader)
-SELECT * FROM flyway_schema_history;               -- hvilke migreringer som er kjørt
+SELECT * FROM elev;
+SELECT * FROM flyway_schema_history;
 ```
 
-I `psql`: `\dt` viser tabellene, `\q` avslutter.
-
-Med `spring.jpa.show-sql=true` skriver `elev-service` også alle SQL-spørringer til loggen.
-
-**Starte med tom database:** stopp `elev-service` og kjør `docker compose down -v` og `docker compose up -d`. Flyway lager tabellen på nytt ved neste oppstart.
-
-### Ingen duplikater
-
-Samme elevmelding kan bli lest flere ganger fra Kafka. Siden `id` er primærnøkkel og kommer fra meldingen, gjør `save()` slik:
-
-```
-SELECT ... FROM elev WHERE id = ?
-  ├─ finnes ikke → INSERT
-  └─ finnes      → UPDATE (ingen ny rad)
-```
-
-Det kan derfor bare finnes én rad per elev-ID.
-
-## Kommunikasjon: Kafka vs. HTTP
-
-### Over Kafka: opprettelse av elever
-
-`POST /elever` i `elev-api` validerer `navn` og `klasse`, genererer en unik ID og publiserer hele eleven som JSON på topicen `elever`, med elevens ID som meldingsnøkkel. `elev-api` svarer først når Kafka har bekreftet mottak.
-
-`elev-service` lytter på topicen med consumer group `elev-service`, leser JSON-meldingen, lagrer eleven i databasen med samme ID og logger ID-en etter at lagringen er fullført.
-
-**Hvorfor Kafka her?** Kommunikasjonen er asynkron. `elev-api` er ikke avhengig av at `elev-service` kjører akkurat nå – meldingen venter i Kafka til den blir lest. Ingen elever går tapt selv om `elev-service` er nede.
-
-Derfor svarer `POST` med **202 Accepted** og ikke 201 Created: eleven er mottatt og sendt til behandling, men ikke nødvendigvis lagret ennå. En `GET` rett etter `POST` kan derfor gi 404 et kort øyeblikk.
-
-### Over HTTP: henting av elever
-
-`GET /elever` og `GET /elever/{id}` i `elev-api` gjør et HTTP-kall til `elev-service`, som leser fra databasen. GET sender ingen Kafka-meldinger.
-
-**Hvorfor HTTP her?** Klienten trenger svaret med en gang, så kommunikasjonen må være synkron. Hvis `elev-service` ikke svarer, vet vi det med en gang og returnerer **503 Service Unavailable** – ikke en tom liste, fordi en tom liste ville vært feil informasjon.
-
-## Endepunkter
-
-### elev-api (port 8080)
-
-| Metode | Sti             | Svar                                                                     |
-|--------|-----------------|--------------------------------------------------------------------------|
-| POST   | `/elever`       | `202` med eleven (inkl. ID) · `400` ved tomt navn/klasse · `503` hvis Kafka feiler |
-| GET    | `/elever`       | `200` med liste (eventuelt `[]`) · `503` hvis `elev-service` er nede      |
-| GET    | `/elever/{id}`  | `200` med eleven · `404` hvis den ikke finnes · `503` hvis `elev-service` er nede |
-
-Eksempel på body for POST:
-
-```json
-{ "navn": "Ola Nordmann", "klasse": "10A" }
-```
-
-### elev-service (port 8081)
-
-| Metode | Sti             | Svar                                   |
-|--------|-----------------|----------------------------------------|
-| GET    | `/elever`       | `200` med alle elever fra databasen (eventuelt `[]`) |
-| GET    | `/elever/{id}`  | `200` med eleven · `404` hvis den ikke finnes i databasen |
-
-## Konfigurasjon
-
-Adresser og navn ligger i `src/main/resources/application.properties`, ikke i koden.
-
-**elev-api**
-
-```properties
-spring.kafka.bootstrap-servers=${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-elev.kafka.topic=elever
-elev.service.url=${ELEV_SERVICE_URL:http://localhost:8081}
-```
-
-**elev-service** (i tillegg til databaseoppsettet over)
-
-```properties
-server.port=8081
-spring.kafka.bootstrap-servers=${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-spring.kafka.consumer.group-id=elev-service
-spring.kafka.consumer.auto-offset-reset=earliest
-elev.kafka.topic=elever
-```
-
-## Lagring i minnet vs. i database
-
-|                     | I minnet (før)                  | I database (nå)                           |
-|---------------------|---------------------------------|-------------------------------------------|
-| Hvor data ligger    | RAM, inne i Java-prosessen       | PostgreSQL-server, på disk i et Docker-volum |
-| Etter omstart       | Tomt                            | Alt er der fortsatt                        |
-| Hastighet           | Raskest                         | Litt tregere (disk + SQL)                  |
-| Regler (unik ID)    | Må skrives i koden selv          | Håndheves av databasen (primærnøkkel)      |
-| Se innholdet utenfra | Nei                            | Ja, med `psql`, IntelliJ og SQL            |
-
-## Tester
-
-```bash
-cd elev-service && ./gradlew test   # krever Docker
-cd elev-api && ./gradlew test
-```
-
-| Tjeneste | Testklasse | Hva testes |
-|----------|-----------|------------|
-| `elev-service` | `ElevServiceApplicationTests` | Integrasjonstester med ekte PostgreSQL og Kafka via **Testcontainers**: Kafka-melding → database → GET, og at samme melding to ganger gir bare én rad. |
-| `elev-api` | `ElevControllerTests` | `@WebMvcTest` med Mockito-mocks for Kafka og `elev-service`: `202`, `400`, `503` og `404`. |
-
-Testene i `elev-service` starter egne containere og rører ikke databasen i `docker compose`.
-
-### CI (GitHub Actions)
-
-`.github/workflows/ci.yml` kjører ved hver push og pull request:
-
-1. **Test** – `./gradlew test` for begge tjenestene parallelt (Java 25, Testcontainers bruker Docker på GitHub-maskinen).
-2. **Docker image** – bygger begge `Dockerfile`-ene, men bare hvis testene er grønne. Bildene publiseres ikke.
-
-Hvis en test feiler, lastes testrapporten opp som artefakt på kjøringen.
-
-## Merk
-
-- Elevene overlever omstart av `elev-service` fordi de ligger i databasen – ikke fordi Kafka-meldingene leses på nytt.
-- Kafka husker hvor consumer groupen `elev-service` har lest til. Ved omstart leses bare nye meldinger. Elever som opprettes mens `elev-service` er nede, blir lest og lagret når den starter igjen.
+IntelliJ: Database → `+` → Data Source → PostgreSQL → `localhost:5432`, database `elevdb`, user/password `elev`/`elev`.

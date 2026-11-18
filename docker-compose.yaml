@@ -61,6 +61,13 @@ services:
       DB_URL: jdbc:postgresql://postgres:5432/elevdb
       DB_USER: elev
       DB_PASSWORD: elev
+    # Spring Boot Actuator: UP when the app runs and the database answers.
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
     depends_on:
       kafka:
         condition: service_healthy
@@ -76,11 +83,17 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       ELEV_SERVICE_URL: http://elev-service:8081
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
     depends_on:
       kafka:
         condition: service_healthy
       elev-service:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   elev-pgdata:

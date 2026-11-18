@@ -19,6 +19,11 @@ RUN --mount=type=cache,target=/root/.gradle ./gradlew bootJar --no-daemon -q \
 FROM eclipse-temurin:25-jre
 WORKDIR /app
 
+# curl is used by the healthcheck in docker-compose.yaml.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
 # Do not run the application as root.
 RUN useradd --system --uid 1001 spring
 USER spring

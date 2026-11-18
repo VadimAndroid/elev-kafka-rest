@@ -1,5 +1,7 @@
 # Elev-system: elev-api og elev-service
 
+[![CI](https://github.com/VadimAndroid/elev-kafka-rest/actions/workflows/ci.yml/badge.svg?branch=portfolio)](https://github.com/VadimAndroid/elev-kafka-rest/actions/workflows/ci.yml)
+
 To Spring Boot-tjenester skrevet i Kotlin som samarbeider via **Kafka** og **HTTP**.
 `elev-service` lagrer elevene i **PostgreSQL**, slik at de finnes også etter omstart.
 `elev-api` har ingen database.
@@ -264,6 +266,15 @@ cd elev-api && ./gradlew test
 | `elev-api` | `ElevControllerTests` | `@WebMvcTest` med Mockito-mocks for Kafka og `elev-service`: `202`, `400`, `503` og `404`. |
 
 Testene i `elev-service` starter egne containere og rører ikke databasen i `docker compose`.
+
+### CI (GitHub Actions)
+
+`.github/workflows/ci.yml` kjører ved hver push og pull request:
+
+1. **Test** – `./gradlew test` for begge tjenestene parallelt (Java 25, Testcontainers bruker Docker på GitHub-maskinen).
+2. **Docker image** – bygger begge `Dockerfile`-ene, men bare hvis testene er grønne. Bildene publiseres ikke.
+
+Hvis en test feiler, lastes testrapporten opp som artefakt på kjøringen.
 
 ## Merk
 

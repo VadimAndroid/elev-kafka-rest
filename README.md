@@ -65,6 +65,30 @@ Tjenestene kan også startes fra IntelliJ med ▶ ved `fun main` i `ElevServiceA
 Dataene i PostgreSQL ligger i Docker-volumet `elev-pgdata` og blir **ikke** slettet av `docker compose down`.
 `docker compose down -v` sletter også volumet, altså alle elevene.
 
+### Alt i Docker med én kommando
+
+Begge tjenestene har en `Dockerfile`. De ligger i compose-profilen `app`, så de starter bare når profilen er med:
+
+```bash
+docker compose --profile app up -d --build   # Kafka, PostgreSQL, elev-service og elev-api
+docker compose --profile app down            # stopper alt
+```
+
+Porter 8080 og 8081 må være ledige, så stopp tjenestene i IntelliJ først.
+
+| Fil | Hva den gjør |
+|-----|--------------|
+| `Dockerfile` | To steg: bygger jar-filen med Gradle i `eclipse-temurin:25-jdk`, og kjører den i det mindre `eclipse-temurin:25-jre`. Appen kjører som egen bruker, ikke root. |
+| `.dockerignore` | Holder `build`, `.gradle` og lignende utenfor bildet. |
+
+**To lyttere i Kafka.** En container når Kafka på `kafka:29092`, mens IntelliJ på maskinen din når den på `localhost:9092`. Derfor har Kafka to lyttere (`INTERNAL` og `EXTERNAL`). Adressene settes med miljøvariabler i `docker-compose.yaml`:
+
+| Variabel | Lokalt (standard) | I Docker |
+|----------|-------------------|----------|
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | `kafka:29092` |
+| `DB_URL` | `jdbc:postgresql://localhost:5432/elevdb` | `jdbc:postgresql://postgres:5432/elevdb` |
+| `ELEV_SERVICE_URL` | `http://localhost:8081` | `http://elev-service:8081` |
+
 ## Database
 
 ### Oppsett
@@ -202,16 +226,16 @@ Adresser og navn ligger i `src/main/resources/application.properties`, ikke i ko
 **elev-api**
 
 ```properties
-spring.kafka.bootstrap-servers=localhost:9092
+spring.kafka.bootstrap-servers=${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 elev.kafka.topic=elever
-elev.service.url=http://localhost:8081
+elev.service.url=${ELEV_SERVICE_URL:http://localhost:8081}
 ```
 
 **elev-service** (i tillegg til databaseoppsettet over)
 
 ```properties
 server.port=8081
-spring.kafka.bootstrap-servers=localhost:9092
+spring.kafka.bootstrap-servers=${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 spring.kafka.consumer.group-id=elev-service
 spring.kafka.consumer.auto-offset-reset=earliest
 elev.kafka.topic=elever

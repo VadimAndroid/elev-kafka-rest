@@ -1,20 +1,11 @@
 package com.example.elev_service.repository
 
-import com.example.elev_service.model.Elev
-import org.springframework.stereotype.Repository
+import com.example.elev_service.model.ElevEntity
+import org.springframework.data.jpa.repository.JpaRepository
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
-
-@Repository
-class ElevRepository {
-    private val elever = ConcurrentHashMap<UUID, Elev>()
-
-    fun lagre(elev: Elev): Elev {
-        elever[elev.id] = elev
-        return elev
-    }
-    fun finn(id: UUID): Elev? = elever[id]
-
-    fun  finnAlle(): List<Elev> = elever.values.toList()
-}
+/**
+ * Spring Data JPA lager implementasjonen automatisk ved oppstart.
+ * Vi får blant annet save(), findById() og findAll() uten å skrive kode.
+ */
+interface ElevRepository : JpaRepository<ElevEntity, UUID>

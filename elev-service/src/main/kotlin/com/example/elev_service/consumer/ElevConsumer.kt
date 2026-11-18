@@ -1,6 +1,7 @@
 package com.example.elev_service.consumer
 
 import com.example.elev_service.model.Elev
+import com.example.elev_service.model.ElevEntity
 import com.example.elev_service.repository.ElevRepository
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
@@ -17,7 +18,9 @@ class ElevConsumer(
     @KafkaListener(topics = ["\${elev.kafka.topic}"])
     fun motta(melding: String) {
         val elev = jsonMapper.readValue(melding, Elev::class.java)
-        elevRepository.lagre(elev)
-        log.info("Lagret elev med id {}", elev.id)
+        // ID-en fra Kafka er primærnøkkel. Finnes den fra før, oppdaterer save()
+        // den eksisterende raden i stedet for å lage en ny -> ingen duplikater.
+        elevRepository.save(ElevEntity.fra(elev))
+        log.info("Lagret elev med id {} i databasen", elev.id)
     }
 }

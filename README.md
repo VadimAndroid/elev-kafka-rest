@@ -1,17 +1,19 @@
 # Elev-system: elev-api og elev-service
 
 To Spring Boot-tjenester skrevet i Kotlin som samarbeider via **Kafka** og **HTTP**.
-`elev-service` lagrer elevene i en **H2-database med fillagring**, slik at de finnes også etter omstart.
+`elev-service` lagrer elevene i **PostgreSQL**, slik at de finnes også etter omstart.
 `elev-api` har ingen database.
+
+> Dette er grenen **`portfolio`**. Skoleversjonen med H2-database ligger i grenen `main`.
 
 ## Arkitektur
 
 ```
 Opprette elev (asynkront):
-Klient ──HTTP POST──▶ elev-api ──Kafka (topic "elever")──▶ elev-service ──▶ database (H2)
+Klient ──HTTP POST──▶ elev-api ──Kafka (topic "elever")──▶ elev-service ──▶ PostgreSQL
 
 Hente elever (synkront):
-Klient ──HTTP GET───▶ elev-api ──HTTP GET──▶ elev-service ──▶ leser fra database (H2)
+Klient ──HTTP GET───▶ elev-api ──HTTP GET──▶ elev-service ──▶ leser fra PostgreSQL
 ```
 
 | Tjeneste       | Port | Ansvar                                                                 |
@@ -19,6 +21,7 @@ Klient ──HTTP GET───▶ elev-api ──HTTP GET──▶ elev-service 
 | `elev-api`     | 8080 | Eneste inngang for klienten. Validerer, genererer ID, sender til Kafka, henter fra `elev-service`. Lagrer ingenting selv. |
 | `elev-service` | 8081 | Leser elever fra Kafka og lagrer dem i databasen. Tilbyr GET-endepunkter som leser fra databasen. |
 | Kafka          | 9092 | Meldingskø mellom tjenestene (kjører i Docker).                        |
+| PostgreSQL     | 5432 | Databasen til `elev-service` (kjører i Docker, data i volumet `elev-pgdata`). |
 
 ## Forutsetninger
 
@@ -29,11 +32,11 @@ Klient ──HTTP GET───▶ elev-api ──HTTP GET──▶ elev-service 
 
 Start i denne rekkefølgen, fra mappen `elev-kafka-rest`:
 
-**1. Start Kafka**
+**1. Start Kafka og PostgreSQL**
 
 ```bash
 docker compose up -d
-docker ps          # kafka-containeren skal ha status "Up"
+docker ps          # kafka skal ha status "Up", elev-postgres "Up (healthy)"
 ```
 
 Topicen `elever` opprettes automatisk ved første melding. Den kan også opprettes manuelt:
@@ -58,34 +61,43 @@ cd elev-api
 ```
 
 Tjenestene kan også startes fra IntelliJ med ▶ ved `fun main` i `ElevServiceApplication.kt` og `ElevApiApplication.kt`.
-For `elev-service` må *Working directory* i Run Configuration være mappen `elev-service`, ellers havner databasefilen et annet sted.
-
-**Stoppe:** `Ctrl + C` i hver terminal, og `docker compose down` for Kafka.
+**Stoppe:** `Ctrl + C` i hver terminal, og `docker compose down` for Kafka og PostgreSQL.
+Dataene i PostgreSQL ligger i Docker-volumet `elev-pgdata` og blir **ikke** slettet av `docker compose down`.
+`docker compose down -v` sletter også volumet, altså alle elevene.
 
 ## Database
 
 ### Oppsett
 
-`elev-service` bruker **H2** med **fillagring** og **Spring Data JPA**.
+`elev-service` bruker **PostgreSQL 17** og **Spring Data JPA** (med Hibernate).
 
 | Del | Fil | Hva den gjør |
 |-----|-----|--------------|
-| Tilkobling | `application.properties` | `jdbc:h2:file:./data/elevdb` – lagres på disk, ikke i minnet (`mem:`) |
+| Database | `docker-compose.yaml` | PostgreSQL-container `elev-postgres`, database `elevdb`, data i volumet `elev-pgdata` |
+| Tilkobling | `application.properties` | `jdbc:postgresql://localhost:5432/elevdb`, kan overstyres med miljøvariabler |
 | Tabell | `src/main/resources/db/migration/V1__opprett_elev_tabell.sql` | Flyway-migrering som lager tabellen `elev` |
 | Entity | `model/ElevEntity.kt` | JPA-klassen som tilsvarer én rad i `elev` |
 | Repository | `repository/ElevRepository.kt` | `JpaRepository<ElevEntity, UUID>` – gir `save`, `findById`, `findAll` |
 
 ```properties
-spring.datasource.url=jdbc:h2:file:./data/elevdb
-spring.datasource.username=sa
-spring.datasource.password=
+spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/elevdb}
+spring.datasource.username=${DB_USER:elev}
+spring.datasource.password=${DB_PASSWORD:elev}
 spring.jpa.hibernate.ddl-auto=validate
 spring.jpa.show-sql=true
-spring.h2.console.enabled=true
-spring.h2.console.path=/h2-console
 ```
 
-Databasefilen ligger i `elev-service/data/elevdb.mv.db`. Mappen `data/` er lagt i `.gitignore`, fordi den inneholder data og ikke kode.
+`${DB_PASSWORD:elev}` betyr: bruk miljøvariabelen `DB_PASSWORD` hvis den finnes, ellers `elev`.
+Lokalt fungerer standardverdiene direkte. I et ekte miljø settes passordet som miljøvariabel og ligger ikke i git.
+
+Avhengigheter i `elev-service/build.gradle.kts`:
+
+```kotlin
+implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+implementation("org.springframework.boot:spring-boot-starter-flyway")
+implementation("org.flywaydb:flyway-database-postgresql")  // Flyway trenger egen modul per database
+runtimeOnly("org.postgresql:postgresql")                    // JDBC-driver
+```
 
 Tabellen `elev`:
 
@@ -105,25 +117,30 @@ Hibernate står på `ddl-auto=validate`, så det kun *sjekker* at `ElevEntity` s
 
 ### Kontrollere innholdet i databasen
 
-1. Start `elev-service`.
-2. Åpne H2-konsollen: <http://localhost:8081/h2-console>
-3. Logg inn med:
-   - **JDBC URL:** `jdbc:h2:file:./data/elevdb` (ikke standardverdien `jdbc:h2:~/test`)
-   - **User Name:** `sa`
-   - **Password:** (tomt)
-4. Kjør SQL, for eksempel:
+**Med `psql` i containeren:**
+
+```bash
+docker exec -it elev-postgres psql -U elev -d elevdb
+```
+
+**Med IntelliJ:** Database-vinduet → `+` → Data Source → PostgreSQL →
+host `localhost`, port `5432`, database `elevdb`, bruker `elev`, passord `elev`.
+
+Nyttige spørringer:
 
 ```sql
 SELECT * FROM elev;                                -- alle elever
 SELECT COUNT(*) FROM elev;                         -- antall rader
 SELECT id, COUNT(*) FROM elev GROUP BY id
   HAVING COUNT(*) > 1;                             -- duplikater (skal gi 0 rader)
-SELECT * FROM "flyway_schema_history";             -- hvilke migreringer som er kjørt
+SELECT * FROM flyway_schema_history;               -- hvilke migreringer som er kjørt
 ```
+
+I `psql`: `\dt` viser tabellene, `\q` avslutter.
 
 Med `spring.jpa.show-sql=true` skriver `elev-service` også alle SQL-spørringer til loggen.
 
-**Starte med tom database:** stopp `elev-service` og slett mappen `elev-service/data`. Flyway lager tabellen på nytt ved neste oppstart.
+**Starte med tom database:** stopp `elev-service` og kjør `docker compose down -v` og `docker compose up -d`. Flyway lager tabellen på nytt ved neste oppstart.
 
 ### Ingen duplikater
 
@@ -204,11 +221,11 @@ elev.kafka.topic=elever
 
 |                     | I minnet (før)                  | I database (nå)                           |
 |---------------------|---------------------------------|-------------------------------------------|
-| Hvor data ligger    | RAM, inne i Java-prosessen       | Fil på disk (`data/elevdb.mv.db`)          |
+| Hvor data ligger    | RAM, inne i Java-prosessen       | PostgreSQL-server, på disk i et Docker-volum |
 | Etter omstart       | Tomt                            | Alt er der fortsatt                        |
 | Hastighet           | Raskest                         | Litt tregere (disk + SQL)                  |
 | Regler (unik ID)    | Må skrives i koden selv          | Håndheves av databasen (primærnøkkel)      |
-| Se innholdet utenfra | Nei                            | Ja, med H2-konsollen og SQL                |
+| Se innholdet utenfra | Nei                            | Ja, med `psql`, IntelliJ og SQL            |
 
 ## Merk
 

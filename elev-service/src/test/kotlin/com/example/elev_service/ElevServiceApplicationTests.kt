@@ -1,26 +1,29 @@
 package com.example.elev_service
 
-import com.example.elev_service.consumer.ElevConsumer
 import com.example.elev_service.repository.ElevRepository
+import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc
+import org.springframework.context.annotation.Import
+import org.springframework.data.repository.findByIdOrNull
+import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.web.servlet.get
+import java.time.Duration
+import java.util.UUID
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 
 /**
- * Testene bruker en egen H2-database i minnet, ikke den ekte filen i data/.
- * Kafka-lytteren startes ikke, så testene leser ikke meldinger fra den ekte consumer groupen.
+ * Integration tests against a real PostgreSQL and a real Kafka (Testcontainers).
+ * The flow is the same as in production: Kafka message -> ElevConsumer -> PostgreSQL -> GET.
  */
-@SpringBootTest(
-    properties = [
-        "spring.datasource.url=jdbc:h2:mem:testdb",
-        "spring.kafka.listener.auto-startup=false",
-    ],
-)
+@SpringBootTest
+@Import(TestcontainersConfiguration::class)
 @AutoConfigureMockMvc
 class ElevServiceApplicationTests {
 
@@ -31,19 +34,25 @@ class ElevServiceApplicationTests {
     lateinit var elevRepository: ElevRepository
 
     @Autowired
-    lateinit var elevConsumer: ElevConsumer
+    lateinit var kafkaTemplate: KafkaTemplate<String, String>
+
+    @Value("\${elev.kafka.topic}")
+    lateinit var topic: String
 
     @BeforeEach
-    fun tomDatabase() {
+    fun emptyDatabase() {
         elevRepository.deleteAll()
     }
 
-    @Test
-    fun contextLoads() {
+    private fun melding(id: UUID, navn: String, klasse: String) =
+        """{"id":"$id","navn":"$navn","klasse":"$klasse"}"""
+
+    private fun send(id: UUID, json: String) {
+        kafkaTemplate.send(topic, id.toString(), json).get()
     }
 
     @Test
-    fun `GET elever gir tom liste naar databasen er tom`() {
+    fun `GET elever returns an empty list when the database is empty`() {
         mockMvc.get("/elever").andExpect {
             status { isOk() }
             content { json("[]") }
@@ -51,24 +60,47 @@ class ElevServiceApplicationTests {
     }
 
     @Test
-    fun `GET elev som ikke finnes gir 404`() {
-        mockMvc.get("/elever/00000000-0000-0000-0000-000000000000").andExpect {
+    fun `GET elever with unknown id returns 404`() {
+        mockMvc.get("/elever/${UUID.randomUUID()}").andExpect {
             status { isNotFound() }
         }
     }
 
     @Test
-    fun `samme melding to ganger gir bare en rad`() {
-        val melding = """{"id":"11111111-1111-1111-1111-111111111111","navn":"Duplikat Test","klasse":"9C"}"""
+    fun `a Kafka message is stored in PostgreSQL and returned by GET`() {
+        val id = UUID.randomUUID()
 
-        elevConsumer.motta(melding)
-        elevConsumer.motta(melding)
+        send(id, melding(id, "Ola Nordmann", "10A"))
 
-        assertEquals(1, elevRepository.count())
-        mockMvc.get("/elever/11111111-1111-1111-1111-111111111111").andExpect {
+        await().atMost(Duration.ofSeconds(30)).untilAsserted {
+            assertNotNull(elevRepository.findByIdOrNull(id))
+        }
+        mockMvc.get("/elever/$id").andExpect {
             status { isOk() }
-            jsonPath("$.navn") { value("Duplikat Test") }
-            jsonPath("$.klasse") { value("9C") }
+            jsonPath("$.id") { value(id.toString()) }
+            jsonPath("$.navn") { value("Ola Nordmann") }
+            jsonPath("$.klasse") { value("10A") }
+        }
+    }
+
+    @Test
+    fun `the same Kafka message twice creates only one row`() {
+        val id = UUID.randomUUID()
+        val markerId = UUID.randomUUID()
+
+        send(id, melding(id, "Duplikat Test", "9C"))
+        send(id, melding(id, "Duplikat Test", "9C"))
+        // Same key -> same partition -> processed after the two duplicates.
+        // When the marker is stored, both duplicates have been handled.
+        kafkaTemplate.send(topic, id.toString(), melding(markerId, "Marker", "0X")).get()
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted {
+            assertNotNull(elevRepository.findByIdOrNull(markerId))
+        }
+        assertEquals(2, elevRepository.count())
+        mockMvc.get("/elever").andExpect {
+            status { isOk() }
+            jsonPath("$.length()") { value(2) }
         }
     }
 }

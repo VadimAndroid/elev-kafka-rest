@@ -227,6 +227,20 @@ elev.kafka.topic=elever
 | Regler (unik ID)    | Må skrives i koden selv          | Håndheves av databasen (primærnøkkel)      |
 | Se innholdet utenfra | Nei                            | Ja, med `psql`, IntelliJ og SQL            |
 
+## Tester
+
+```bash
+cd elev-service && ./gradlew test   # krever Docker
+cd elev-api && ./gradlew test
+```
+
+| Tjeneste | Testklasse | Hva testes |
+|----------|-----------|------------|
+| `elev-service` | `ElevServiceApplicationTests` | Integrasjonstester med ekte PostgreSQL og Kafka via **Testcontainers**: Kafka-melding → database → GET, og at samme melding to ganger gir bare én rad. |
+| `elev-api` | `ElevControllerTests` | `@WebMvcTest` med Mockito-mocks for Kafka og `elev-service`: `202`, `400`, `503` og `404`. |
+
+Testene i `elev-service` starter egne containere og rører ikke databasen i `docker compose`.
+
 ## Merk
 
 - Elevene overlever omstart av `elev-service` fordi de ligger i databasen – ikke fordi Kafka-meldingene leses på nytt.
